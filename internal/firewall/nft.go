@@ -1,0 +1,284 @@
+// Package firewall drives nftables. There is no database of its own: the
+// nftables set `inet spa allowed` IS the whitelist, each element carrying a
+// comment "id=<N> added=<RFC3339>" (N = 1, 2, 3, ... for convenient display and
+// deletion) and, if retention is configured, a native
+// nftables timeout. The ruleset is snapshotted to a file loaded at boot.
+package firewall
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log"
+	"net/netip"
+	"os"
+	"os/exec"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+)
+
+var (
+	ErrNotFound = errors.New("no matching entry")
+	ErrBadKey   = errors.New("not an IPv4 address or a numeric id")
+)
+
+// Runner executes nft: optional stdin, arguments, returns stdout.
+type Runner func(stdin string, args ...string) ([]byte, error)
+
+type Nft struct {
+	Run       Runner
+	RulesPath string        // snapshot loaded at boot
+	Retention time.Duration // 0 = forever
+	Now       func() time.Time
+}
+
+func New(bin, rulesPath string, retention time.Duration) *Nft {
+	return &Nft{Run: execRunner(bin), RulesPath: rulesPath, Retention: retention, Now: time.Now}
+}
+
+func execRunner(bin string) Runner {
+	return func(stdin string, args ...string) ([]byte, error) {
+		cmd := exec.Command(bin, args...)
+		if stdin != "" {
+			cmd.Stdin = strings.NewReader(stdin)
+		}
+		var out, errb bytes.Buffer
+		cmd.Stdout, cmd.Stderr = &out, &errb
+		if err := cmd.Run(); err != nil {
+			return out.Bytes(), fmt.Errorf("nft %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(errb.String()))
+		}
+		return out.Bytes(), nil
+	}
+}
+
+// Entry is one whitelisted address.
+type Entry struct {
+	IP        netip.Addr
+	ID        int    // 1..N; 0 for entries added by hand with nft
+	Added     string // RFC3339 or ""
+	Permanent bool
+	Expires   time.Duration // time left, if !Permanent
+}
+
+// Allow whitelists ip and returns its number. An address that is already
+// present keeps its number (its timeout is refreshed); a new address gets
+// max+1. The change is ONE atomic nft transaction.
+func (n *Nft) Allow(ip netip.Addr) (int, error) {
+	ip = ip.Unmap()
+	if !ip.Is4() {
+		return 0, errors.New("only IPv4 is supported")
+	}
+	entries, err := n.List()
+	if err != nil {
+		return 0, err
+	}
+	id := nextID(entries, ip)
+	attrs := ""
+	if n.Retention > 0 {
+		attrs = fmt.Sprintf(" timeout %ds", int64(n.Retention/time.Second))
+	}
+	comment := fmt.Sprintf("id=%d added=%s", id, n.Now().UTC().Format(time.RFC3339))
+	script := fmt.Sprintf(
+		"add element %[1]s %[2]s %[3]s { %[4]s }\n"+
+			"delete element %[1]s %[2]s %[3]s { %[4]s }\n"+
+			"add element %[1]s %[2]s %[3]s { %[4]s%[5]s comment \"%[6]s\" }\n",
+		Family, Table, Set, ip, attrs, comment)
+	if _, err := n.Run(script, "-f", "-"); err != nil {
+		return 0, err
+	}
+	if err := n.Persist(); err != nil {
+		log.Printf("PERSIST_ERROR err=%q (access is granted but will not survive a reboot until the next successful save)", err)
+	}
+	return id, nil
+}
+
+// nextID: an address already in the set keeps its number, a new one gets max+1.
+// Numbers of deleted clients are not reused while a higher number still exists.
+func nextID(entries []Entry, ip netip.Addr) int {
+	max := 0
+	for _, e := range entries {
+		if e.IP == ip && e.ID > 0 {
+			return e.ID
+		}
+		if e.ID > max {
+			max = e.ID
+		}
+	}
+	return max + 1
+}
+
+// List returns the current whitelist, sorted by address.
+func (n *Nft) List() ([]Entry, error) {
+	out, err := n.Run("", "-j", "list", "set", Family, Table, Set)
+	if err != nil {
+		return nil, err
+	}
+	return parseSet(out)
+}
+
+// Delete removes entries matching key: an IPv4 address or a number from List.
+func (n *Nft) Delete(key string) ([]Entry, error) {
+	addr, addrErr := netip.ParseAddr(key)
+	id := 0
+	if addrErr != nil {
+		v, err := strconv.Atoi(key)
+		if err != nil || v < 1 {
+			return nil, ErrBadKey
+		}
+		id = v
+	}
+	all, err := n.List()
+	if err != nil {
+		return nil, err
+	}
+	var hit []Entry
+	for _, e := range all {
+		if (addrErr == nil && e.IP == addr.Unmap()) || (addrErr != nil && e.ID == id) {
+			hit = append(hit, e)
+		}
+	}
+	if len(hit) == 0 {
+		return nil, ErrNotFound
+	}
+	var script strings.Builder
+	for _, e := range hit {
+		fmt.Fprintf(&script, "delete element %s %s %s { %s }\n", Family, Table, Set, e.IP)
+	}
+	if _, err := n.Run(script.String(), "-f", "-"); err != nil {
+		return nil, err
+	}
+	if err := n.Persist(); err != nil {
+		log.Printf("PERSIST_ERROR err=%q", err)
+	}
+	return hit, nil
+}
+
+// VerifyLocked checks that our table is active and its input chain is default-drop.
+func (n *Nft) VerifyLocked() error {
+	out, err := n.Run("", "list", "chain", Family, Table, "input")
+	if err != nil {
+		return fmt.Errorf("firewall table %s %s is not active: %w", Family, Table, err)
+	}
+	if !strings.Contains(string(out), "policy drop") {
+		return errors.New("the input chain is not default-drop")
+	}
+	return nil
+}
+
+// Persist snapshots the whole live ruleset to RulesPath (atomic, mode 0600).
+// Rules added by hand with nft are kept. Elements keep their remaining time.
+func (n *Nft) Persist() error {
+	out, err := n.Run("", "list", "ruleset")
+	if err != nil {
+		return err
+	}
+	data := "# Managed by spa-server: snapshot of the live ruleset, loaded at boot.\nflush ruleset\n" + string(out)
+	tmp := n.RulesPath + ".tmp"
+	if err := os.WriteFile(tmp, []byte(data), 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, n.RulesPath)
+}
+
+// PersistLoop refreshes the snapshot periodically so that, after a reboot,
+// timed entries do not get back time that already elapsed.
+func (n *Nft) PersistLoop(ctx context.Context, every time.Duration) {
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			if err := n.Persist(); err != nil {
+				log.Printf("PERSIST_ERROR err=%q", err)
+			}
+		}
+	}
+}
+
+// EnsureLoaded loads the saved ruleset if our table is not active (safety net;
+// normally spa-firewall.service has already done it at boot).
+func (n *Nft) EnsureLoaded() (loaded bool, err error) {
+	if _, err := n.Run("", "list", "table", Family, Table); err == nil {
+		return false, nil
+	}
+	_, err = n.Run("", "-f", n.RulesPath)
+	return err == nil, err
+}
+
+// Check validates a ruleset file without applying it.
+func (n *Nft) Check(path string) error {
+	_, err := n.Run("", "-c", "-f", path)
+	return err
+}
+
+type setDoc struct {
+	Nftables []struct {
+		Set *struct {
+			Elem []json.RawMessage `json:"elem"`
+		} `json:"set"`
+	} `json:"nftables"`
+}
+
+type elemObj struct {
+	Elem struct {
+		Val     string `json:"val"`
+		Timeout *int64 `json:"timeout"`
+		Expires *int64 `json:"expires"`
+		Comment string `json:"comment"`
+	} `json:"elem"`
+}
+
+func parseSet(raw []byte) ([]Entry, error) {
+	var doc setDoc
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return nil, fmt.Errorf("parse nft json: %w", err)
+	}
+	var out []Entry
+	for _, item := range doc.Nftables {
+		if item.Set == nil {
+			continue
+		}
+		for _, r := range item.Set.Elem {
+			var e Entry
+			var plain string
+			if json.Unmarshal(r, &plain) == nil { // bare address, no attributes
+				a, err := netip.ParseAddr(plain)
+				if err != nil {
+					continue
+				}
+				e.IP, e.Permanent = a, true
+			} else {
+				var o elemObj
+				if err := json.Unmarshal(r, &o); err != nil {
+					continue
+				}
+				a, err := netip.ParseAddr(o.Elem.Val)
+				if err != nil {
+					continue
+				}
+				e.IP = a
+				e.Permanent = o.Elem.Timeout == nil
+				if o.Elem.Expires != nil {
+					e.Expires = time.Duration(*o.Elem.Expires) * time.Second
+				}
+				for _, f := range strings.Fields(o.Elem.Comment) {
+					switch {
+					case strings.HasPrefix(f, "id="):
+						e.ID, _ = strconv.Atoi(strings.TrimPrefix(f, "id="))
+					case strings.HasPrefix(f, "added="):
+						e.Added = strings.TrimPrefix(f, "added=")
+					}
+				}
+			}
+			out = append(out, e)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].IP.Less(out[j].IP) })
+	return out, nil
+}
