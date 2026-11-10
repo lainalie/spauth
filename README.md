@@ -18,41 +18,40 @@ SPA (Single Packet Authorization): port-knocking утилита для возм�
 
 Утилита не является средством для обхода анализа пакетов. Это лишь инструмент для более удобного обеления IP руками с разных устройств, чтобы не заходить каждый раз на сервер из-под серийной консоли.
 
-## Установка на сервер
+## Сборка сервера
 
 ### Требования и зависимости
 
-1. Ваш сервер работает на linux
+1. Ваш сервер работает на linux. Клиент может быть на любой ОС и архитектуре.
 2. (опционально) У вас установлен nftables
 3. (опционально) Другие файрволлы не запущены. Утилита это проверяет и отключает их сама, но лучше переубедиться.
 
 ### Компиляция
 
 1. Установите Go
-```sh
-wget https://go.dev/dl/go1.27.3.linux-amd64.tar.gz 
-sudo rm -rf /usr/local/go # удаляет прошлые сборки для избежания конфликтов
-sudo tar -C /usr/local -xzf go1.27.3.linux-amd64.tar.gz
-sudo echo 'export PATH=$PATH:/usr/local/go/bin' >> "$HOME/.profile"
-sudo echo 'export PATH="$PATH:$(go env GOPATH)/bin"' >> "$HOME/.profile"
+    ```sh
+    wget https://go.dev/dl/go1.27.3.linux-amd64.tar.gz 
+    sudo rm -rf /usr/local/go # удаляет прошлые сборки для избежания конфликтов
+    sudo tar -C /usr/local -xzf go1.27.3.linux-amd64.tar.gz
+    sudo echo 'export PATH=$PATH:/usr/local/go/bin' >> "$HOME/.profile"
+    sudo echo 'export PATH="$PATH:$(go env GOPATH)/bin"' >> "$HOME/.profile"
 
-logout # После установки нужно сделать релог
-go version # Убедитесь, что после релога go установлен
-```
+    logout # После установки нужно сделать релог
+    go version # Убедитесь, что после релога go установлен
+    ```
 
-2. Соберите сервер под вашу платформу и ОС
-```sh
-cd spauth-main
-go mod tidy
-go build -o spa-server ./cmd/spa-server
-sudo chmod +x spa-server 
-sudo ./spa-server init
-```
+2. Скачайте репозиторий и соберите сервер под вашу платформу и ОС
+    ```sh
+    cd spauth-main
+    go mod tidy
+    go build -o spa-server ./cmd/spa-server
+    sudo chmod +x spa-server 
+    sudo ./spa-server init # Выполняется 1 раз для установки
+    ```
 
 ### Инициализация
 
 После `spa-server init`:
-
 1. Показывается предупреждение и список найденных файрволов. Вам нужно согласиться, написав 'yes'.
 2. После согласия нужно указать UDP-порт от 1024 до 65535 и срок хранения IP в минутах (Enter = бессрочно). Порт можно задать флагом `--port`. Уже использующиеся порты, например, исходящие использоваться не будут и появится предупреждение.
 3. Генерируется пароль длиной 20 символов. Его нужно сохранить.
@@ -61,15 +60,60 @@ sudo ./spa-server init
 
 Если используется SSH, то его сессия може оборваться, а может и нет. Рассчитывать на ssh после установки не стоит, после выхода из сессии он работать уже не будет.
 
-## Юседж
+### Использование
 
 ```sh
-spa-cli --host SERVER --port PORT [--timeout 30s] [--password-stdin]   # клиент, порта по умолчанию нет
-sudo spa-server status              # порт, активен ли файрвол (default-deny), демон, число клиентов
+spa-cli --host SERVER --port PORT [--timeout 30s] [--password-stdin]
+sudo spa-server status              # порт, активен ли файрвол, демон, число клиентов
 sudo spa-server list                # номер, IP, когда добавлен, сколько осталось
-sudo spa-server delete <номер|ip>   # удалить; соединения этого IP обрываются
-sudo spa-server save                # сохранить live-ruleset на диск (после ручных правок nft)
+sudo spa-server delete <номер|ip>   # удалить запись. Соединения этого IP обрываются
+sudo spa-server save                # сохранить live-ruleset на диск, если были ручные правки nft
 ```
+
+## Сборка клиента
+
+### Компиляция
+
+#### Linux/Android Termux
+1. Установите Go (см. установку выше)
+2. Скачайте репозиторий и соберите сервер
+    ```sh
+    cd spauth-main
+    go mod tidy
+    go build -o spa-cli ./cmd/spa-cli
+    sudo chmod +x spa-cli
+    ```
+
+#### Windows
+1. [Установите Go](https://go.dev/dl/go1.27.3.windows-amd64.msi) и перезапустите терминалы
+2. Скачайте репозиторий и соберите сервер
+    ```console
+    cd spauth-main
+    go mod tidy
+    go build -o spa-cli.exe ./cmd/spa-cli
+    ```
+
+### Использование
+
+#### Linux
+```
+sudo ./spa-cli --host IP --port PORT
+```
+
+#### Windows
+```
+spa-cli.exe --host IP --port PORT
+```
+
+Подробнее:
+```
+spa-cli
+  --host SERVER         # IP сервера
+  --port PORT           # Порт
+  [--timeout 30s]       # Ручное указание таймаута, после которого попытки аутентифицироваться прекращаются
+  [--password-stdin]    # Для ввода пароля из cli-пайплайна, например, через echo, чтобы не вводить пароль руками (небезопасно)
+```
+
 
 ## Что стоит знать
 
