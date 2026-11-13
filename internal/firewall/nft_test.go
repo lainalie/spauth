@@ -1,6 +1,8 @@
 package firewall
 
 import (
+	"sync"
+	"sync/atomic"
 	"errors"
 	"net/netip"
 	"os"
@@ -416,5 +418,71 @@ func TestRealNftLifecycle(t *testing.T) {
 	n.EnsureLoaded()
 	if es, _ = n.List(); len(es) != 0 {
 		t.Fatalf("deletion not persisted: %+v", es)
+	}
+}
+
+// Writer A lists the table (an IP is still allowed) and stalls. Meanwhile the IP
+// is revoked and writer B persists. A must NOT be able to publish its older
+// listing afterwards: the old snapshot would bring the revoked IP back at boot.
+func TestStaleSnapshotCannotOverwriteNewer(t *testing.T) {
+	var mu sync.Mutex
+	state := "table inet spa {\n\tchain input {\n\t\ttype filter hook input priority filter; policy drop;\n\t}\n\t# ip 203.0.113.7 allowed\n}\n"
+	firstListStarted := make(chan struct{})
+	release := make(chan struct{})
+	var listCalls int32
+
+	n := &Nft{RulesPath: filepath.Join(t.TempDir(), "spa.nft"), BootConf: "/etc/nftables.conf", Now: time.Now}
+	n.Run = func(stdin string, args ...string) ([]byte, error) {
+		if strings.Join(args, " ") != "list table inet spa" {
+			return nil, nil
+		}
+		mu.Lock()
+		snap := state
+		mu.Unlock()
+		if atomic.AddInt32(&listCalls, 1) == 1 {
+			close(firstListStarted)
+			<-release // writer A stalls holding an old listing
+		}
+		return []byte(snap), nil
+	}
+
+	errA := make(chan error, 1)
+	go func() { errA <- n.Persist() }()
+	<-firstListStarted
+
+	mu.Lock() // the IP is revoked
+	state = strings.Replace(state, "# ip 203.0.113.7 allowed", "# revoked", 1)
+	mu.Unlock()
+
+	errB := make(chan error, 1)
+	go func() { errB <- n.Persist() }()
+	time.Sleep(150 * time.Millisecond) // give B every chance to run ahead of A
+	close(release)
+
+	if err := <-errA; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-errB; err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(n.RulesPath)
+	if strings.Contains(string(b), "203.0.113.7") || !strings.Contains(string(b), "# revoked") {
+		t.Fatalf("a stale snapshot overwrote the newer one:\n%s", b)
+	}
+}
+
+// If the new state cannot be saved, delete must not claim plain success: the
+// IP is gone from the live set, but an old snapshot may let it in after a reboot.
+func TestDeleteReportsUnsavedRemoval(t *testing.T) {
+	n, calls := fake(realJSON, "list table") // the snapshot step fails
+	got, err := n.Delete("203.0.113.7")
+	if !errors.Is(err, ErrNotSaved) {
+		t.Fatalf("want ErrNotSaved, got %v", err)
+	}
+	if len(got) != 1 || got[0].IP != netip.MustParseAddr("203.0.113.7") {
+		t.Fatalf("the removed entry must still be reported: %+v", got)
+	}
+	if !strings.HasPrefix(script(*calls), "delete element inet spa allowed { 203.0.113.7 }") {
+		t.Fatalf("the live set was not changed:\n%s", script(*calls))
 	}
 }

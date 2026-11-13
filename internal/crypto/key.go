@@ -74,19 +74,32 @@ func SaveMasterKey(path string, master []byte) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	// CreateTemp: a unique file that is always created 0600 (a leftover ".tmp"
+	// with looser permissions can never be reused), fsynced before the rename.
+	f, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp-*")
 	if err != nil {
 		return err
 	}
+	tmp := f.Name()
 	if _, err := f.WriteString(hex.EncodeToString(master) + "\n"); err != nil {
 		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		os.Remove(tmp)
 		return err
 	}
 	if err := f.Close(); err != nil {
+		os.Remove(tmp)
 		return err
 	}
-	return os.Rename(tmp, path)
+	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 // LoadMasterKey reads the key file and refuses group/world-accessible files.

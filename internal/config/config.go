@@ -74,10 +74,45 @@ func Load(dir string) (Config, error) {
 
 // WriteFileAtomic writes via a temp file + rename so a crash never leaves a
 // half-written file (important for the firewall ruleset loaded at boot).
+//
+//   - The temp file is unique, so concurrent writers never share one.
+//   - The data is fsynced BEFORE the rename: otherwise, after a power loss, the
+//     new name may point to an empty file, and an empty ruleset loaded at boot
+//     leaves the host open.
+//   - The directory is fsynced afterwards so the rename itself survives.
 func WriteFileAtomic(path string, data []byte, perm os.FileMode) error {
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, perm); err != nil {
+	dir := filepath.Dir(path)
+	f, err := os.CreateTemp(dir, filepath.Base(path)+".tmp-*")
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	tmp := f.Name()
+	committed := false
+	defer func() {
+		if !committed {
+			f.Close()
+			os.Remove(tmp)
+		}
+	}()
+	if _, err := f.Write(data); err != nil {
+		return err
+	}
+	if err := f.Chmod(perm); err != nil {
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	committed = true
+	if d, err := os.Open(dir); err == nil { // best effort: not supported everywhere
+		d.Sync()
+		d.Close()
+	}
+	return nil
 }
