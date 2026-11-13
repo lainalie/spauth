@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -90,6 +91,47 @@ func askRetention(in *bufio.Reader) int {
 	}
 }
 
+// askTelegram asks whether the Telegram address ranges may reach this host.
+// The default (Enter) is no.
+func askTelegram(in *bufio.Reader) bool {
+	for {
+		switch strings.ToLower(prompt(in, "\nAllow the Telegram address ranges ("+strconv.Itoa(len(firewall.TelegramCIDRs))+
+			" subnets) through the firewall without a knock? [yes/no, default: no]: ")) {
+		case "", "n", "no":
+			return false
+		case "y", "yes":
+			return true
+		}
+		fmt.Println("Please answer yes or no.")
+	}
+}
+
+// backupForeignConf copies path into dir if it exists and was not written by us,
+// so that overwriting the system nftables config never destroys someone's rules.
+func backupForeignConf(path, dir string) (string, error) {
+	old, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	if strings.HasPrefix(string(old), firewall.ManagedMarker) {
+		return "", nil
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", err
+	}
+	backup := filepath.Join(dir, filepath.Base(path)+".orig")
+	for i := 1; ; i++ { // never overwrite an earlier backup
+		if _, err := os.Stat(backup); os.IsNotExist(err) {
+			break
+		}
+		backup = filepath.Join(dir, fmt.Sprintf("%s.orig.%d", filepath.Base(path), i))
+	}
+	return backup, os.WriteFile(backup, old, 0o600)
+}
+
 func printWarning(found []install.Finding, existing bool) {
 	fmt.Println()
 	fmt.Println(red("WARNING - READ CAREFULLY"))
@@ -98,6 +140,8 @@ func printWarning(found []install.Finding, existing bool) {
 	fmt.Println(red("    IPv4 and IPv6, except one UDP \"knock\" port that you will choose in a moment."))
 	fmt.Println(red("  * This includes SSH. Your CURRENT SSH SESSION and other incoming connections MAY BE DROPPED"))
 	fmt.Println(red("    as soon as the firewall is applied. Do not count on the session surviving."))
+	fmt.Println(red("  * " + config.NftablesConf + " will be OVERWRITTEN (a copy of someone else's file is saved in " + config.DefaultDir + "):"))
+	fmt.Println(red("    it will only clear the ruleset and include the files of this tool."))
 	fmt.Println(red("  * Every other firewall will be stopped, disabled and flushed:"))
 	if len(found) == 0 {
 		fmt.Println("      (none detected)")
@@ -123,8 +167,15 @@ func initCmd(args []string) {
 	port := fs.Int("port", 0, "UDP port of the knock service; asked interactively if omitted")
 	retention := fs.Int("retention", -1, "minutes an allowed IP is kept (0 = unlimited); asked interactively if omitted")
 	yes := fs.Bool("yes", false, "do not ask for confirmation (automation)")
+	telegram := fs.Bool("telegram", false, "allow the Telegram address ranges; asked interactively if the flag is omitted (no with --yes)")
+	nftConf := fs.String("nftables-conf", config.NftablesConf, "system nftables config to overwrite")
 	filesOnly := fs.Bool("files-only", false, "development: only create key/config/ruleset files; do not touch the system")
 	_ = fs.Parse(args)
+	telegramSet := false
+	fs.Visit(func(f *flag.Flag) { telegramSet = telegramSet || f.Name == "telegram" })
+	if *filesOnly && *nftConf == config.NftablesConf {
+		*nftConf = filepath.Join(*dir, "nftables.conf") // development: never touch /etc/nftables.conf
+	}
 
 	if *port != 0 {
 		if err := install.CheckPortRange(*port); err != nil {
@@ -166,6 +217,10 @@ func initCmd(args []string) {
 			cfg.RetentionMinutes = askRetention(in)
 		}
 	}
+	cfg.Telegram = *telegram
+	if !telegramSet && !*yes {
+		cfg.Telegram = askTelegram(in)
+	}
 	if err := cfg.Validate(); err != nil {
 		log.Fatal(err)
 	}
@@ -202,14 +257,37 @@ func initCmd(args []string) {
 	if err := config.Save(*dir, cfg); err != nil {
 		log.Fatal(err)
 	}
-	rules := config.RulesPath(*dir)
-	if err := config.WriteFileAtomic(rules, []byte(firewall.Baseline(cfg.Port)), 0o600); err != nil {
+	rules, tgPath, boot := config.RulesPath(*dir), config.TelegramPath(*dir), *nftConf
+	if err := config.WriteFileAtomic(rules, []byte(firewall.Baseline(cfg.Port, cfg.Telegram)), 0o600); err != nil {
+		log.Fatal(err)
+	}
+	if cfg.Telegram {
+		if err := config.WriteFileAtomic(tgPath, []byte(firewall.TelegramFile()), 0o600); err != nil {
+			log.Fatal(err)
+		}
+	} else if err := os.Remove(tgPath); err != nil && !os.IsNotExist(err) {
+		log.Fatal(err)
+	}
+	// The system config is validated as a whole (nft -c follows the includes)
+	// BEFORE it replaces the old one, so a mistake cannot leave a broken boot config.
+	newBoot := boot + ".spa-new"
+	if err := config.WriteFileAtomic(newBoot, []byte(firewall.MainConf(tgPath, rules, cfg.Telegram)), 0o644); err != nil {
 		log.Fatal(err)
 	}
 	if nftBin != "" {
-		if err := firewall.New(nftBin, rules, 0).Check(rules); err != nil {
+		if err := firewall.New(nftBin, rules, boot, 0).Check(newBoot); err != nil {
+			os.Remove(newBoot)
 			log.Fatalf("generated ruleset failed validation, nothing was changed: %v", err)
 		}
+	}
+	if backup, err := backupForeignConf(boot, *dir); err != nil {
+		os.Remove(newBoot)
+		log.Fatalf("cannot back up %s, nothing was changed: %v", boot, err)
+	} else if backup != "" {
+		fmt.Printf("The previous %s was saved as %s\n", boot, backup)
+	}
+	if err := os.Rename(newBoot, boot); err != nil {
+		log.Fatal(err)
 	}
 	if *filesOnly {
 		fmt.Printf("Files written to %s (development mode: the system was not touched).\n", *dir)
@@ -218,7 +296,7 @@ func initCmd(args []string) {
 	if err := install.InstallBinary(); err != nil {
 		log.Fatal(err)
 	}
-	if err := install.WriteUnits(nftBin, *dir, rules); err != nil {
+	if err := install.WriteUnits(nftBin, *dir, boot); err != nil {
 		log.Fatal(err)
 	}
 
@@ -238,7 +316,7 @@ func initCmd(args []string) {
 		fmt.Println(red("FIREWALL WAS NOT APPLIED - this host is currently OPEN: " + err.Error()))
 		os.Exit(1)
 	}
-	if err := firewall.New(nftBin, rules, 0).VerifyLocked(); err != nil {
+	if err := firewall.New(nftBin, rules, boot, 0).VerifyLocked(); err != nil {
 		fmt.Println(red("FIREWALL CHECK FAILED - this host may be OPEN: " + err.Error()))
 		os.Exit(1)
 	}

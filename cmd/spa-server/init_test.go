@@ -7,6 +7,8 @@ import (
 	"io"
 	"net"
 	"os"
+	"path/filepath"
+	"spa-prototype/internal/firewall"
 	"spa-prototype/internal/install"
 	"strconv"
 	"strings"
@@ -43,6 +45,43 @@ func TestChoosePortAllowsOwnPort(t *testing.T) {
 	}
 	if validatePort(p, 0) == nil {
 		t.Fatal("busy port accepted when it is not ours")
+	}
+}
+
+// Telegram is opt-in: Enter means no, only yes/y turns it on, anything else asks again.
+func TestAskTelegram(t *testing.T) {
+	for in, want := range map[string]bool{"\n": false, "no\n": false, "N\n": false, "yes\n": true, "Y\n": true, "maybe\nyes\n": true, "what\n\n": false} {
+		if got := askTelegram(bufio.NewReader(strings.NewReader(in))); got != want {
+			t.Errorf("input %q: got %v, want %v", in, got, want)
+		}
+	}
+}
+
+// A system nftables.conf written by someone else is backed up before it is
+// overwritten; one written by us is simply replaced (no pile of backups).
+func TestBackupForeignConf(t *testing.T) {
+	dir := t.TempDir()
+	conf := filepath.Join(dir, "nftables.conf")
+	save := filepath.Join(dir, "spa")
+
+	if b, err := backupForeignConf(conf, save); b != "" || err != nil {
+		t.Fatalf("missing file: %q %v", b, err)
+	}
+	os.WriteFile(conf, []byte("table inet filter { chain input { policy accept; } }\n"), 0o644)
+	b1, err := backupForeignConf(conf, save)
+	if err != nil || b1 == "" {
+		t.Fatalf("foreign file not backed up: %q %v", b1, err)
+	}
+	if got, _ := os.ReadFile(b1); !strings.Contains(string(got), "policy accept") {
+		t.Fatalf("backup content: %q", got)
+	}
+	b2, _ := backupForeignConf(conf, save)
+	if b2 == b1 {
+		t.Fatal("an earlier backup was overwritten")
+	}
+	os.WriteFile(conf, []byte(firewall.ManagedMarker+" test\nflush ruleset\n"), 0o644)
+	if b, err := backupForeignConf(conf, save); b != "" || err != nil {
+		t.Fatalf("our own file must not be backed up: %q %v", b, err)
 	}
 }
 

@@ -185,7 +185,7 @@ func InstallBinary() error {
 
 // WriteUnits installs spa-firewall.service (loads the ruleset very early at
 // boot) and spa-server.service (the daemon).
-func WriteUnits(nftBin, dir, rulesPath string) error {
+func WriteUnits(nftBin, dir, bootConf string) error {
 	fw := fmt.Sprintf(`[Unit]
 Description=SPA firewall (nftables default-deny ruleset)
 DefaultDependencies=no
@@ -201,7 +201,7 @@ ExecStart=%s -f %s
 
 [Install]
 WantedBy=sysinit.target
-`, nftBin, rulesPath)
+`, nftBin, bootConf)
 	srv := fmt.Sprintf(`[Unit]
 Description=SPA knock daemon
 After=spa-firewall.service network.target

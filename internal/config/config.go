@@ -12,6 +12,10 @@ import (
 
 const (
 	DefaultDir = "/etc/spa"
+	// NftablesConf is the system-wide nftables config: the one a distribution's
+	// nftables.service (and our spa-firewall.service) loads. init overwrites it
+	// with "flush ruleset" plus includes of our own files from DefaultDir.
+	NftablesConf = "/etc/nftables.conf"
 	// MaxRetentionMinutes is one year. 0 means "never expire".
 	MaxRetentionMinutes = 525600
 )
@@ -19,6 +23,7 @@ const (
 type Config struct {
 	Port             uint16 `json:"port"`
 	RetentionMinutes int    `json:"retention_minutes"` // 0 = keep allowed IPs forever
+	Telegram         bool   `json:"telegram,omitempty"` // allow Telegram address ranges
 }
 
 func (c Config) Retention() time.Duration { return time.Duration(c.RetentionMinutes) * time.Minute }
@@ -35,7 +40,14 @@ func (c Config) Validate() error {
 
 func ConfigPath(dir string) string { return filepath.Join(dir, "config.json") }
 func KeyPath(dir string) string    { return filepath.Join(dir, "key") }
-func RulesPath(dir string) string  { return filepath.Join(dir, "nftables.conf") }
+
+// RulesPath is our own nft file: the `inet spa` table (rules + allowed set),
+// included by NftablesConf. The daemon keeps it in sync with the live table.
+func RulesPath(dir string) string { return filepath.Join(dir, "spa.nft") }
+
+// TelegramPath holds the Telegram address ranges (nft `define`), included
+// before RulesPath, only if the administrator chose to allow Telegram.
+func TelegramPath(dir string) string { return filepath.Join(dir, "telegram.nft") }
 
 func Save(dir string, c Config) error {
 	if err := c.Validate(); err != nil {

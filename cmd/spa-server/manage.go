@@ -118,6 +118,11 @@ func statusCmd(args []string) {
 	}
 	fmt.Printf("Knock port:       udp/%d\n", cfg.Port)
 	fmt.Printf("Retention:        %s\n", ret)
+	if cfg.Telegram {
+		fmt.Println("Telegram ranges:  allowed without a knock")
+	} else {
+		fmt.Println("Telegram ranges:  not allowed")
+	}
 	if err := nft.VerifyLocked(); err != nil {
 		fmt.Println("Firewall:         " + red("NOT LOCKED - this host is OPEN ("+err.Error()+")"))
 	} else {

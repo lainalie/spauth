@@ -1,6 +1,7 @@
 package config
 
 import (
+	"path/filepath"
 	"os"
 	"testing"
 	"time"
@@ -29,5 +30,20 @@ func TestValidate(t *testing.T) {
 	}
 	if (Config{Port: 1, RetentionMinutes: 0}).Validate() != nil {
 		t.Fatal("0 (forever) must be valid")
+	}
+}
+
+func TestTelegramRoundTripAndPaths(t *testing.T) {
+	dir := t.TempDir() + "/spa"
+	in := Config{Port: 40123, Telegram: true}
+	if err := Save(dir, in); err != nil {
+		t.Fatal(err)
+	}
+	out, err := Load(dir)
+	if err != nil || out != in || !out.Telegram {
+		t.Fatalf("%v %+v", err, out)
+	}
+	if RulesPath("/etc/spa") != filepath.Join("/etc/spa", "spa.nft") || TelegramPath("/etc/spa") != filepath.Join("/etc/spa", "telegram.nft") {
+		t.Fatalf("paths: %s %s", RulesPath("/etc/spa"), TelegramPath("/etc/spa"))
 	}
 }
