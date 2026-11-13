@@ -250,74 +250,74 @@ func initCmd(args []string) {
 		prompt(in, "\nPress Enter after you have saved the password... ")
 	}
 
-	// Everything is prepared BEFORE the lockdown, so a mistake cannot leave a half-configured host.
-	if err := crypto.SaveMasterKey(config.KeyPath(*dir), master); err != nil {
-		log.Fatal(err)
-	}
-	if err := config.Save(*dir, cfg); err != nil {
-		log.Fatal(err)
-	}
 	rules, tgPath, boot := config.RulesPath(*dir), config.TelegramPath(*dir), *nftConf
-	if err := config.WriteFileAtomic(rules, []byte(firewall.Baseline(cfg.Port, cfg.Telegram)), 0o600); err != nil {
-		log.Fatal(err)
-	}
-	if cfg.Telegram {
-		if err := config.WriteFileAtomic(tgPath, []byte(firewall.TelegramFile()), 0o600); err != nil {
-			log.Fatal(err)
+
+	// Nothing on the host has been changed yet. Remember the current state NOW:
+	// if activation fails below, it is put back (rules, services, nftables config).
+	var snap install.Snapshot
+	if !*filesOnly {
+		var err error
+		if snap, err = install.TakeSnapshot(*dir, boot, found); err != nil {
+			log.Fatalf("cannot record the current firewall state, nothing was changed: %v", err)
 		}
-	} else if err := os.Remove(tgPath); err != nil && !os.IsNotExist(err) {
-		log.Fatal(err)
-	}
-	// The system config is validated as a whole (nft -c follows the includes)
-	// BEFORE it replaces the old one, so a mistake cannot leave a broken boot config.
-	newBoot := boot + ".spa-new"
-	if err := config.WriteFileAtomic(newBoot, []byte(firewall.MainConf(tgPath, rules, cfg.Telegram)), 0o644); err != nil {
-		log.Fatal(err)
-	}
-	if nftBin != "" {
-		if err := firewall.New(nftBin, rules, boot, 0).Check(newBoot); err != nil {
-			os.Remove(newBoot)
-			log.Fatalf("generated ruleset failed validation, nothing was changed: %v", err)
+		if snap.Dir != "" {
+			fmt.Println("A copy of the current firewall rules was saved in", snap.Dir)
+		}
+		// A re-run of init: the old daemon still holds the old key and keeps
+		// saving its old client list. It is stopped BEFORE the new key and the
+		// empty client list are written, so it cannot put the old state back.
+		if err := install.StopDaemon(); err != nil {
+			log.Fatalf("cannot stop the running daemon, nothing was changed: %v", err)
 		}
 	}
-	if backup, err := backupForeignConf(boot, *dir); err != nil {
-		os.Remove(newBoot)
-		log.Fatalf("cannot back up %s, nothing was changed: %v", boot, err)
-	} else if backup != "" {
-		fmt.Printf("The previous %s was saved as %s\n", boot, backup)
+	if err := os.MkdirAll(*dir, 0o700); err != nil {
+		log.Fatal(err)
 	}
-	if err := os.Rename(newBoot, boot); err != nil {
+
+	// Everything is prepared BEFORE the lockdown, so a mistake cannot leave a half-configured host.
+	// The files are written under the same lock as the snapshots of the running daemon and of
+	// `spa-server save/delete`, so none of them can interleave with this.
+	err = firewall.WithLock(rules, func() error {
+		return writeInitFiles(*dir, cfg, master, nftBin, boot, rules, tgPath)
+	})
+	if err != nil {
+		if !*filesOnly {
+			err = fmt.Errorf("%w (the old daemon was stopped; the firewall that was active is still active; run init again)", err)
+		}
 		log.Fatal(err)
 	}
 	if *filesOnly {
 		fmt.Printf("Files written to %s (development mode: the system was not touched).\n", *dir)
 		return
 	}
-	if err := install.InstallBinary(); err != nil {
-		log.Fatal(err)
+
+	act := install.Activation{
+		Snapshot: snap,
+		Verify:   firewall.New(nftBin, rules, boot, 0).VerifyLocked,
 	}
-	if err := install.WriteUnits(nftBin, *dir, boot); err != nil {
-		log.Fatal(err)
+	prepared := func() error {
+		if err := install.InstallBinary(); err != nil {
+			return err
+		}
+		return install.WriteUnits(nftBin, *dir, boot)
+	}
+	if err := prepared(); err != nil {
+		if problems := act.Rollback(); len(problems) > 0 {
+			fmt.Println(red("could not fully restore the previous state: " + strings.Join(problems, "; ")))
+		}
+		log.Fatalf("nothing was activated: %v", err)
 	}
 
 	// From here the connection we are typing over may die: keep going anyway.
 	signal.Ignore(syscall.SIGHUP, syscall.SIGPIPE)
-	for _, w := range install.DisableFirewalls(found) {
+	fmt.Println("\nApplying the firewall now. Your SSH session MAY be dropped.")
+	// Our ruleset is loaded and verified first; only then are the other firewalls disabled.
+	warnings, err := install.Activate(act)
+	for _, w := range warnings {
 		fmt.Println("warning:", w)
 	}
-	if err := install.Systemctl("enable", "spa-firewall.service", "spa-server.service"); err != nil {
-		log.Fatal(err)
-	}
-
-	fmt.Println("\nApplying the firewall now. Your SSH session MAY be dropped.")
-	// restart, not start: the unit is a oneshot with RemainAfterExit, so on a
-	// re-run `start` would do nothing and leave the host open after the flush above.
-	if err := install.Systemctl("restart", "spa-firewall.service"); err != nil {
-		fmt.Println(red("FIREWALL WAS NOT APPLIED - this host is currently OPEN: " + err.Error()))
-		os.Exit(1)
-	}
-	if err := firewall.New(nftBin, rules, boot, 0).VerifyLocked(); err != nil {
-		fmt.Println(red("FIREWALL CHECK FAILED - this host may be OPEN: " + err.Error()))
+	if err != nil {
+		fmt.Println(red("ACTIVATION FAILED: " + err.Error()))
 		os.Exit(1)
 	}
 	if err := install.Systemctl("restart", "spa-server.service"); err != nil {
@@ -326,4 +326,49 @@ func initCmd(args []string) {
 	}
 	fmt.Println("Done. The host is closed; knock with: spa-cli --host <this-server> --port", cfg.Port)
 	fmt.Println("Check the state any time with: sudo spa-server status")
+}
+
+// writeInitFiles writes key, config, our nft files and the system nftables
+// config. The caller holds the snapshot lock. The system config is validated as
+// a whole (nft -c follows the includes) BEFORE it replaces the old one.
+func writeInitFiles(dir string, cfg config.Config, master []byte, nftBin, boot, rules, tgPath string) error {
+	if err := crypto.SaveMasterKey(config.KeyPath(dir), master); err != nil {
+		return err
+	}
+	if err := config.Save(dir, cfg); err != nil {
+		return err
+	}
+	if err := config.WriteFileAtomic(rules, []byte(firewall.Baseline(cfg.Port, cfg.Telegram)), 0o600); err != nil {
+		return err
+	}
+	if cfg.Telegram {
+		if err := config.WriteFileAtomic(tgPath, []byte(firewall.TelegramFile()), 0o600); err != nil {
+			return err
+		}
+	} else if err := os.Remove(tgPath); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	newBoot := boot + ".spa-new"
+	if err := config.WriteFileAtomic(newBoot, []byte(firewall.MainConf(tgPath, rules, cfg.Telegram)), 0o644); err != nil {
+		return err
+	}
+	if nftBin != "" {
+		if err := firewall.New(nftBin, rules, boot, 0).Check(newBoot); err != nil {
+			os.Remove(newBoot)
+			return fmt.Errorf("generated ruleset failed validation: %w", err)
+		}
+	}
+	backup, err := backupForeignConf(boot, dir)
+	if err != nil {
+		os.Remove(newBoot)
+		return fmt.Errorf("cannot back up %s: %w", boot, err)
+	}
+	if backup != "" {
+		fmt.Printf("The previous %s was saved as %s\n", boot, backup)
+	}
+	if err := os.Rename(newBoot, boot); err != nil {
+		os.Remove(newBoot)
+		return err
+	}
+	return nil
 }
