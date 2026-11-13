@@ -207,7 +207,7 @@ func TestBaselineContent(t *testing.T) {
 	for _, must := range []string{
 		"flush ruleset", "table inet spa", "policy drop", "udp dport 40123 accept",
 		"ct state established ct direction reply accept", "ip saddr @allowed accept",
-		"icmp type destination-unreachable drop",
+		"icmp type { destination-unreachable, time-exceeded, parameter-problem } drop",
 	} {
 		if !strings.Contains(r, must) {
 			t.Errorf("baseline lacks %q", must)
@@ -217,6 +217,27 @@ func TestBaselineContent(t *testing.T) {
 	for _, bad := range []string{"icmp type echo", "tcp dport", "policy accept;\n\t\tiif"} {
 		if strings.Contains(r, bad) {
 			t.Errorf("baseline must not contain %q", bad)
+		}
+	}
+}
+
+// The UDP exceptions must be IPv4-only (the daemon listens on udp4), and the
+// kernel's own ICMP/ICMPv6 error messages must be suppressed on output.
+func TestBaselineIPv4OnlyExceptionsAndSilentICMP(t *testing.T) {
+	r := Baseline(40123)
+	for _, line := range strings.Split(r, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.Contains(line, "udp ") && strings.HasSuffix(line, "accept") &&
+			!strings.HasPrefix(line, "meta nfproto ipv4 ") {
+			t.Errorf("UDP exception is not pinned to IPv4: %q", line)
+		}
+	}
+	for _, must := range []string{
+		"icmp type { destination-unreachable, time-exceeded, parameter-problem } drop",
+		"icmpv6 type { destination-unreachable, time-exceeded, parameter-problem } drop",
+	} {
+		if !strings.Contains(r, must) {
+			t.Errorf("baseline lacks %q", must)
 		}
 	}
 }
