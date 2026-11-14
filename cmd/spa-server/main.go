@@ -27,6 +27,8 @@ func main() {
 		statusCmd(args)
 	case "save":
 		saveCmd(args)
+	case "uninstall":
+		uninstallCmd(args)
 	default:
 		usage()
 		os.Exit(2)
@@ -40,5 +42,6 @@ func usage() {
   spa-server status                                            firewall / daemon / port overview
   spa-server list                                              show allowed clients
   spa-server delete <number|ip>                                  remove an allowed client
-  spa-server save                                              snapshot the live ruleset to disk`)
+  spa-server save                                              snapshot the live ruleset to disk
+  spa-server uninstall [--yes] [--keep-files]                  restore the previous firewall state and remove spa-server (as root)`)
 }

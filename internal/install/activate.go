@@ -50,6 +50,9 @@ func TakeSnapshot(dir, bootConf string, found []Finding) (Snapshot, error) {
 	for t, rules := range s.Iptables {
 		files[t+"-save.rules"] = rules + "\n"
 	}
+	if s.BootExisted {
+		files[bootFile] = string(s.BootData)
+	}
 	if len(files) == 0 {
 		return s, nil
 	}

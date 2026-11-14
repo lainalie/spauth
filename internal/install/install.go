@@ -247,10 +247,10 @@ ReadWritePaths=%s
 [Install]
 WantedBy=multi-user.target
 `, BinPath, dir, dir)
-	if err := os.WriteFile("/etc/systemd/system/spa-firewall.service", []byte(fw), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(UnitDir, "spa-firewall.service"), []byte(fw), 0o644); err != nil {
 		return err
 	}
-	if err := os.WriteFile("/etc/systemd/system/spa-server.service", []byte(srv), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(UnitDir, "spa-server.service"), []byte(srv), 0o644); err != nil {
 		return err
 	}
 	_, err := sh("systemctl", "daemon-reload")

@@ -255,6 +255,7 @@ func initCmd(args []string) {
 	// Nothing on the host has been changed yet. Remember the current state NOW:
 	// if activation fails below, it is put back (rules, services, nftables config).
 	var snap install.Snapshot
+	savedState := false // restore.json written by THIS run (removed again if nothing was installed)
 	if !*filesOnly {
 		var err error
 		if snap, err = install.TakeSnapshot(*dir, boot, found); err != nil {
@@ -262,6 +263,15 @@ func initCmd(args []string) {
 		}
 		if snap.Dir != "" {
 			fmt.Println("A copy of the current firewall rules was saved in", snap.Dir)
+		}
+		// What `spa-server uninstall` restores. Written before anything is changed, so even
+		// an init that dies half-way leaves it. Only on the FIRST init: on a re-run the
+		// current state is our own installation, not the original host.
+		if !existing {
+			if err := install.SaveState(*dir, snap); err != nil {
+				log.Fatalf("cannot save the restore information, nothing was changed: %v", err)
+			}
+			savedState = true
 		}
 		// A re-run of init: the old daemon still holds the old key and keeps
 		// saving its old client list. It is stopped BEFORE the new key and the
@@ -284,6 +294,9 @@ func initCmd(args []string) {
 		if !*filesOnly {
 			err = fmt.Errorf("%w (the old daemon was stopped; the firewall that was active is still active; run init again)", err)
 		}
+		if savedState {
+			install.RemoveState(*dir) // nothing was installed
+		}
 		log.Fatal(err)
 	}
 	if *filesOnly {
@@ -304,6 +317,8 @@ func initCmd(args []string) {
 	if err := prepared(); err != nil {
 		if problems := act.Rollback(); len(problems) > 0 {
 			fmt.Println(red("could not fully restore the previous state: " + strings.Join(problems, "; ")))
+		} else if savedState {
+			install.RemoveState(*dir)
 		}
 		log.Fatalf("nothing was activated: %v", err)
 	}
@@ -318,6 +333,9 @@ func initCmd(args []string) {
 	}
 	if err != nil {
 		fmt.Println(red("ACTIVATION FAILED: " + err.Error()))
+		if savedState && !strings.Contains(err.Error(), "with problems") {
+			install.RemoveState(*dir) // the previous state was restored completely
+		}
 		os.Exit(1)
 	}
 	if err := install.Systemctl("restart", "spa-server.service"); err != nil {
