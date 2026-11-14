@@ -2,6 +2,9 @@
 del /f /q .\bin\*.*
 
 go mod tidy
+
+set CGO_ENABLED=0&& set GOOS=linux&& set GOARCH=amd64&& go build -trimpath -buildvcs=false -ldflags="-s -w" -o bin\spa-server-linux-amd64 ./cmd/spa-server
+
 set CGO_ENABLED=0&& set GOOS=windows&& set GOARCH=amd64&& go build -trimpath -buildvcs=false -ldflags="-s -w" -o bin\spa-cli-windows-amd64.exe ./cmd/spa-cli
 set CGO_ENABLED=0&& set GOOS=windows&& set GOARCH=arm64&& go build -trimpath -buildvcs=false -ldflags="-s -w" -o bin\spa-cli-windows-arm64.exe ./cmd/spa-cli
 set CGO_ENABLED=0&& set GOOS=windows&& set GOARCH=386&& go build -trimpath -buildvcs=false -ldflags="-s -w" -o bin\spa-cli-windows-386.exe ./cmd/spa-cli
