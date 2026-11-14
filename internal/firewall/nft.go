@@ -2,7 +2,8 @@
 // nftables set `inet spa allowed` IS the whitelist, each element carrying a
 // comment "id=<N> added=<RFC3339>" (N = 1, 2, 3, ... for convenient display and
 // deletion) and, if retention is configured, a native
-// nftables timeout. The ruleset is snapshotted to a file loaded at boot.
+// nftables timeout. The table is snapshotted to our own file (RulesPath), which
+// the system nftables config (BootConf, /etc/nftables.conf) includes at boot.
 package firewall
 
 import (
@@ -13,17 +14,21 @@ import (
 	"fmt"
 	"log"
 	"net/netip"
-	"os"
 	"os/exec"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
+
+	"spa-prototype/internal/config"
 )
 
 var (
 	ErrNotFound = errors.New("no matching entry")
 	ErrBadKey   = errors.New("not an IPv4 address or a numeric id")
+	// ErrNotSaved: the change was applied to the running firewall, but writing
+	// the snapshot that is loaded at boot failed.
+	ErrNotSaved = errors.New("applied to the running firewall but NOT saved to disk")
 )
 
 // Runner executes nft: optional stdin, arguments, returns stdout.
@@ -31,13 +36,14 @@ type Runner func(stdin string, args ...string) ([]byte, error)
 
 type Nft struct {
 	Run       Runner
-	RulesPath string        // snapshot loaded at boot
+	RulesPath string        // snapshot of the `inet spa` table (our own .nft file)
+	BootConf  string        // system config loaded at boot; includes RulesPath
 	Retention time.Duration // 0 = forever
 	Now       func() time.Time
 }
 
-func New(bin, rulesPath string, retention time.Duration) *Nft {
-	return &Nft{Run: execRunner(bin), RulesPath: rulesPath, Retention: retention, Now: time.Now}
+func New(bin, rulesPath, bootConf string, retention time.Duration) *Nft {
+	return &Nft{Run: execRunner(bin), RulesPath: rulesPath, BootConf: bootConf, Retention: retention, Now: time.Now}
 }
 
 func execRunner(bin string) Runner {
@@ -152,7 +158,10 @@ func (n *Nft) Delete(key string) ([]Entry, error) {
 		return nil, err
 	}
 	if err := n.Persist(); err != nil {
-		log.Printf("PERSIST_ERROR err=%q", err)
+		// The IP is already gone from the live set, but the snapshot loaded at
+		// boot may still contain it. Do not report plain success.
+		log.Printf("PERSIST_ERROR err=%q (the removal is not saved; an old snapshot could restore access after a reboot)", err)
+		return hit, fmt.Errorf("%w: %v", ErrNotSaved, err)
 	}
 	return hit, nil
 }
@@ -169,19 +178,28 @@ func (n *Nft) VerifyLocked() error {
 	return nil
 }
 
-// Persist snapshots the whole live ruleset to RulesPath (atomic, mode 0600).
-// Rules added by hand with nft are kept. Elements keep their remaining time.
+// Persist snapshots the live `inet spa` table (rules and allowed set) to
+// RulesPath (atomic, mode 0600). Elements keep their remaining time. Only our
+// own table is saved: if it is missing (someone flushed the ruleset), Persist
+// fails and the previous good snapshot stays untouched.
+//
+// Taking the snapshot and publishing it is ONE critical section (WithLock,
+// shared with the other processes): a writer that listed the table earlier can
+// never publish after one that listed it later, so a stale snapshot cannot
+// bring back an IP that was revoked in between.
 func (n *Nft) Persist() error {
-	out, err := n.Run("", "list", "ruleset")
-	if err != nil {
-		return err
-	}
-	data := "# Managed by spa-server: snapshot of the live ruleset, loaded at boot.\nflush ruleset\n" + string(out)
-	tmp := n.RulesPath + ".tmp"
-	if err := os.WriteFile(tmp, []byte(data), 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, n.RulesPath)
+	return WithLock(n.RulesPath, func() error {
+		out, err := n.Run("", "list", "table", Family, Table)
+		if err != nil {
+			return err
+		}
+		if !strings.Contains(string(out), "policy drop") {
+			return errors.New("the live spa table is not default-drop: snapshot not overwritten")
+		}
+		data := ManagedMarker + " Snapshot of the live " + Family + " " + Table +
+			" table, included by " + n.BootConf + ".\n" + string(out)
+		return config.WriteFileAtomic(n.RulesPath, []byte(data), 0o600)
+	})
 }
 
 // PersistLoop refreshes the snapshot periodically so that, after a reboot,
@@ -201,13 +219,14 @@ func (n *Nft) PersistLoop(ctx context.Context, every time.Duration) {
 	}
 }
 
-// EnsureLoaded loads the saved ruleset if our table is not active (safety net;
-// normally spa-firewall.service has already done it at boot).
+// EnsureLoaded loads the system config (which includes our table) if our table
+// is not active (safety net; normally spa-firewall.service has already done it
+// at boot).
 func (n *Nft) EnsureLoaded() (loaded bool, err error) {
 	if _, err := n.Run("", "list", "table", Family, Table); err == nil {
 		return false, nil
 	}
-	_, err = n.Run("", "-f", n.RulesPath)
+	_, err = n.Run("", "-f", n.BootConf)
 	return err == nil, err
 }
 

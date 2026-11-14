@@ -30,7 +30,7 @@ func openFirewall(dir string) (*firewall.Nft, config.Config) {
 	if err != nil {
 		log.Fatal("nft binary not found")
 	}
-	return firewall.New(bin, config.RulesPath(dir), cfg.Retention()), cfg
+	return firewall.New(bin, config.RulesPath(dir), config.NftablesConf, cfg.Retention()), cfg
 }
 
 func serveCmd(args []string) {

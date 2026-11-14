@@ -1,6 +1,8 @@
 package firewall
 
 import (
+	"sync"
+	"sync/atomic"
 	"errors"
 	"net/netip"
 	"os"
@@ -37,8 +39,8 @@ func fake(listJSON string, failOn string) (*Nft, *[]call) {
 		switch {
 		case strings.HasPrefix(joined, "-j list set"):
 			return []byte(listJSON), nil
-		case joined == "list ruleset":
-			return []byte("table inet spa {\n}\n"), nil
+		case joined == "list table inet spa":
+			return []byte("table inet spa {\n\tchain input {\n\t\ttype filter hook input priority filter; policy drop;\n\t}\n}\n"), nil
 		case joined == "list chain inet spa input":
 			return []byte("chain input {\n\ttype filter hook input priority filter; policy drop;\n}\n"), nil
 		}
@@ -189,25 +191,75 @@ func TestVerifyLocked(t *testing.T) {
 
 func TestPersistWritesSnapshot(t *testing.T) {
 	n, _ := fake("", "")
-	n.RulesPath = filepath.Join(t.TempDir(), "nftables.conf")
+	n.RulesPath = filepath.Join(t.TempDir(), "spa.nft")
+	n.BootConf = "/etc/nftables.conf"
 	if err := n.Persist(); err != nil {
 		t.Fatal(err)
 	}
 	b, _ := os.ReadFile(n.RulesPath)
-	if !strings.Contains(string(b), "flush ruleset\ntable inet spa") {
-		t.Fatalf("snapshot:\n%s", b)
+	got := string(b)
+	if !strings.HasPrefix(got, ManagedMarker) || !strings.Contains(got, "\ntable inet spa {") {
+		t.Fatalf("snapshot:\n%s", got)
+	}
+	// the snapshot is included from nftables.conf, which already flushes: it must not flush itself
+	if strings.Contains(got, "flush ruleset") {
+		t.Fatalf("snapshot must not flush the ruleset:\n%s", got)
 	}
 	if st, _ := os.Stat(n.RulesPath); st.Mode().Perm() != 0o600 {
 		t.Fatal("snapshot must be 0600")
 	}
 }
 
+// If the live ruleset is not ours any more (flushed, or replaced by another
+// firewall), the good snapshot on disk must not be overwritten.
+func TestPersistKeepsGoodSnapshotWhenTableIsGone(t *testing.T) {
+	n, _ := fake("", "")
+	n.RulesPath = filepath.Join(t.TempDir(), "spa.nft")
+	if err := os.WriteFile(n.RulesPath, []byte("GOOD"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for name, run := range map[string]Runner{
+		"table missing": func(string, ...string) ([]byte, error) { return nil, errors.New("No such file or directory") },
+		"not drop":      func(string, ...string) ([]byte, error) { return []byte("table inet spa {\n}\n"), nil },
+	} {
+		n.Run = run
+		if n.Persist() == nil {
+			t.Fatalf("%s: Persist must fail", name)
+		}
+		if b, _ := os.ReadFile(n.RulesPath); string(b) != "GOOD" {
+			t.Fatalf("%s: snapshot was overwritten: %q", name, b)
+		}
+	}
+}
+
+func TestEnsureLoadedUsesBootConf(t *testing.T) {
+	n, calls := fake("", "")
+	n.BootConf = "/etc/nftables.conf"
+	var loadedFrom string
+	run := n.Run
+	n.Run = func(stdin string, args ...string) ([]byte, error) {
+		joined := strings.Join(args, " ")
+		if joined == "list table inet spa" {
+			return nil, errors.New("no such table") // table is not active
+		}
+		if len(args) == 2 && args[0] == "-f" {
+			loadedFrom = args[1]
+			return nil, nil
+		}
+		return run(stdin, args...)
+	}
+	loaded, err := n.EnsureLoaded()
+	if err != nil || !loaded || loadedFrom != "/etc/nftables.conf" {
+		t.Fatalf("loaded=%v err=%v from=%q calls=%v", loaded, err, loadedFrom, *calls)
+	}
+}
+
 func TestBaselineContent(t *testing.T) {
-	r := Baseline(40123)
+	r := Baseline(40123, false)
 	for _, must := range []string{
-		"flush ruleset", "table inet spa", "policy drop", "udp dport 40123 accept",
+		"table inet spa", "policy drop", "udp dport 40123 accept",
 		"ct state established ct direction reply accept", "ip saddr @allowed accept",
-		"icmp type destination-unreachable drop",
+		"icmp type { destination-unreachable, time-exceeded, parameter-problem } drop",
 	} {
 		if !strings.Contains(r, must) {
 			t.Errorf("baseline lacks %q", must)
@@ -221,6 +273,64 @@ func TestBaselineContent(t *testing.T) {
 	}
 }
 
+// The UDP exceptions must be IPv4-only (the daemon listens on udp4), and the
+// kernel's own ICMP/ICMPv6 error messages must be suppressed on output.
+func TestBaselineIPv4OnlyExceptionsAndSilentICMP(t *testing.T) {
+	r := Baseline(40123, false)
+	for _, line := range strings.Split(r, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.Contains(line, "udp ") && strings.HasSuffix(line, "accept") &&
+			!strings.HasPrefix(line, "meta nfproto ipv4 ") {
+			t.Errorf("UDP exception is not pinned to IPv4: %q", line)
+		}
+	}
+	for _, must := range []string{
+		"icmp type { destination-unreachable, time-exceeded, parameter-problem } drop",
+		"icmpv6 type { destination-unreachable, time-exceeded, parameter-problem } drop",
+	} {
+		if !strings.Contains(r, must) {
+			t.Errorf("baseline lacks %q", must)
+		}
+	}
+}
+
+func TestTelegramIncludedBeforeTable(t *testing.T) {
+	conf := MainConf("/etc/spa/telegram.nft", "/etc/spa/spa.nft", true)
+	flush := strings.Index(conf, "flush ruleset")
+	tg := strings.Index(conf, `include "/etc/spa/telegram.nft"`)
+	tbl := strings.Index(conf, `include "/etc/spa/spa.nft"`)
+	if !(flush >= 0 && flush < tg && tg < tbl) {
+		t.Fatalf("order must be flush, telegram, spa table:\n%s", conf)
+	}
+	if !strings.HasPrefix(conf, ManagedMarker) {
+		t.Fatal("config must start with the managed marker")
+	}
+	if strings.Contains(MainConf("/etc/spa/telegram.nft", "/etc/spa/spa.nft", false), "telegram") {
+		t.Fatal("telegram must not be mentioned when it was not chosen")
+	}
+}
+
+func TestTelegramFileAndRule(t *testing.T) {
+	f := TelegramFile()
+	for _, cidr := range []string{
+		"91.108.56.0/22", "91.108.4.0/22", "91.108.8.0/22", "91.108.16.0/22", "91.108.12.0/22",
+		"149.154.160.0/20", "91.105.192.0/23", "91.108.20.0/22", "185.76.151.0/24",
+	} {
+		if !strings.Contains(f, cidr) {
+			t.Errorf("telegram.nft lacks %s", cidr)
+		}
+	}
+	if !strings.Contains(f, "define TELEGRAM_CIDRS = {") {
+		t.Fatalf("telegram.nft must define the variable:\n%s", f)
+	}
+	if strings.Contains(Baseline(40123, false), "TELEGRAM_CIDRS") {
+		t.Fatal("no telegram rule when it was not chosen")
+	}
+	if !strings.Contains(Baseline(40123, true), "ip saddr $TELEGRAM_CIDRS accept") {
+		t.Fatal("telegram rule missing")
+	}
+}
+
 // ---- real nft, only when explicitly enabled (run inside `unshare -n`) ----
 
 func realNft(t *testing.T) *Nft {
@@ -231,13 +341,17 @@ func realNft(t *testing.T) *Nft {
 	if err != nil {
 		t.Skip("no nft")
 	}
-	rules := filepath.Join(t.TempDir(), "nftables.conf")
-	if err := os.WriteFile(rules, []byte(Baseline(40123)), 0o600); err != nil {
+	dir := t.TempDir()
+	rules, boot := filepath.Join(dir, "spa.nft"), filepath.Join(dir, "nftables.conf")
+	if err := os.WriteFile(rules, []byte(Baseline(40123, false)), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	n := New(bin, rules, 0)
-	if err := n.Check(rules); err != nil {
-		t.Fatalf("baseline does not validate: %v", err)
+	if err := os.WriteFile(boot, []byte(MainConf(filepath.Join(dir, "telegram.nft"), rules, false)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	n := New(bin, rules, boot, 0)
+	if err := n.Check(boot); err != nil {
+		t.Fatalf("config does not validate: %v", err)
 	}
 	if loaded, err := n.EnsureLoaded(); err != nil || !loaded {
 		t.Fatalf("EnsureLoaded: %v %v", loaded, err)
@@ -304,5 +418,71 @@ func TestRealNftLifecycle(t *testing.T) {
 	n.EnsureLoaded()
 	if es, _ = n.List(); len(es) != 0 {
 		t.Fatalf("deletion not persisted: %+v", es)
+	}
+}
+
+// Writer A lists the table (an IP is still allowed) and stalls. Meanwhile the IP
+// is revoked and writer B persists. A must NOT be able to publish its older
+// listing afterwards: the old snapshot would bring the revoked IP back at boot.
+func TestStaleSnapshotCannotOverwriteNewer(t *testing.T) {
+	var mu sync.Mutex
+	state := "table inet spa {\n\tchain input {\n\t\ttype filter hook input priority filter; policy drop;\n\t}\n\t# ip 203.0.113.7 allowed\n}\n"
+	firstListStarted := make(chan struct{})
+	release := make(chan struct{})
+	var listCalls int32
+
+	n := &Nft{RulesPath: filepath.Join(t.TempDir(), "spa.nft"), BootConf: "/etc/nftables.conf", Now: time.Now}
+	n.Run = func(stdin string, args ...string) ([]byte, error) {
+		if strings.Join(args, " ") != "list table inet spa" {
+			return nil, nil
+		}
+		mu.Lock()
+		snap := state
+		mu.Unlock()
+		if atomic.AddInt32(&listCalls, 1) == 1 {
+			close(firstListStarted)
+			<-release // writer A stalls holding an old listing
+		}
+		return []byte(snap), nil
+	}
+
+	errA := make(chan error, 1)
+	go func() { errA <- n.Persist() }()
+	<-firstListStarted
+
+	mu.Lock() // the IP is revoked
+	state = strings.Replace(state, "# ip 203.0.113.7 allowed", "# revoked", 1)
+	mu.Unlock()
+
+	errB := make(chan error, 1)
+	go func() { errB <- n.Persist() }()
+	time.Sleep(150 * time.Millisecond) // give B every chance to run ahead of A
+	close(release)
+
+	if err := <-errA; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-errB; err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(n.RulesPath)
+	if strings.Contains(string(b), "203.0.113.7") || !strings.Contains(string(b), "# revoked") {
+		t.Fatalf("a stale snapshot overwrote the newer one:\n%s", b)
+	}
+}
+
+// If the new state cannot be saved, delete must not claim plain success: the
+// IP is gone from the live set, but an old snapshot may let it in after a reboot.
+func TestDeleteReportsUnsavedRemoval(t *testing.T) {
+	n, calls := fake(realJSON, "list table") // the snapshot step fails
+	got, err := n.Delete("203.0.113.7")
+	if !errors.Is(err, ErrNotSaved) {
+		t.Fatalf("want ErrNotSaved, got %v", err)
+	}
+	if len(got) != 1 || got[0].IP != netip.MustParseAddr("203.0.113.7") {
+		t.Fatalf("the removed entry must still be reported: %+v", got)
+	}
+	if !strings.HasPrefix(script(*calls), "delete element inet spa allowed { 203.0.113.7 }") {
+		t.Fatalf("the live set was not changed:\n%s", script(*calls))
 	}
 }

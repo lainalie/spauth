@@ -18,6 +18,9 @@ type Finding struct {
 	Name   string
 	Detail string
 	unit   string // systemd unit to disable, "" if informational
+
+	// the state before init, needed to put it back if activation fails
+	wasActive, wasEnabled bool
 }
 
 // Units that apply or re-apply packet filtering rules. They are stopped and
@@ -31,8 +34,22 @@ var firewallUnits = []string{
 
 var iptablesTools = []string{"iptables", "ip6tables", "iptables-legacy", "ip6tables-legacy"}
 
-func sh(name string, args ...string) (string, error) {
+// sh, shIn and lookPath are variables so that tests can record the exact
+// sequence of system commands instead of running them.
+var (
+	sh       = realSh
+	shIn     = realShIn
+	lookPath = exec.LookPath
+)
+
+func realSh(name string, args ...string) (string, error) { return realShIn("", name, args...) }
+
+// realShIn runs a command (optional stdin) and returns its combined output.
+func realShIn(stdin, name string, args ...string) (string, error) {
 	cmd := exec.Command(name, args...)
+	if stdin != "" {
+		cmd.Stdin = strings.NewReader(stdin)
+	}
 	var out bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &out
 	err := cmd.Run()
@@ -40,7 +57,7 @@ func sh(name string, args ...string) (string, error) {
 }
 
 func SystemdAvailable() bool {
-	if _, err := exec.LookPath("systemctl"); err != nil {
+	if _, err := lookPath("systemctl"); err != nil {
 		return false
 	}
 	_, err := os.Stat("/run/systemd/system")
@@ -61,16 +78,17 @@ func DetectFirewalls() []Finding {
 			st = append(st, "enabled at boot")
 		}
 		if len(st) > 0 {
-			found = append(found, Finding{Name: u, Detail: strings.Join(st, ", "), unit: u})
+			found = append(found, Finding{Name: u, Detail: strings.Join(st, ", "), unit: u,
+				wasActive: active == "active", wasEnabled: enabled == "enabled"})
 		}
 	}
-	if _, err := exec.LookPath("nft"); err == nil {
+	if _, err := lookPath("nft"); err == nil {
 		if out, err := sh("nft", "list", "ruleset"); err == nil && strings.TrimSpace(out) != "" {
 			found = append(found, Finding{Name: "nftables ruleset", Detail: fmt.Sprintf("%d lines of rules loaded", strings.Count(out, "\n")+1)})
 		}
 	}
 	for _, t := range iptablesTools {
-		if _, err := exec.LookPath(t); err != nil {
+		if _, err := lookPath(t); err != nil {
 			continue
 		}
 		if out, err := sh(t + "-save"); err == nil {
@@ -83,10 +101,15 @@ func DetectFirewalls() []Finding {
 }
 
 // DisableFirewalls stops+disables every detected firewall service and flushes
-// all iptables/nftables rules. It returns non-fatal problems as warnings.
+// all iptables rules. It returns non-fatal problems as warnings.
+//
+// It must run only AFTER our own ruleset is active (see Activate): the host is
+// protected by our default-drop table the whole time. It therefore does NOT
+// flush the nftables ruleset itself (our config already starts with an atomic
+// "flush ruleset", and a later flush would remove our own table too).
 func DisableFirewalls(found []Finding) (warnings []string) {
 	warn := func(f string, a ...any) { warnings = append(warnings, fmt.Sprintf(f, a...)) }
-	if _, err := exec.LookPath("ufw"); err == nil {
+	if _, err := lookPath("ufw"); err == nil {
 		if out, err := sh("ufw", "--force", "disable"); err != nil {
 			warn("ufw disable: %v: %s", err, out)
 		}
@@ -95,12 +118,19 @@ func DisableFirewalls(found []Finding) (warnings []string) {
 		if f.unit == "" {
 			continue
 		}
-		if out, err := sh("systemctl", "disable", "--now", f.unit); err != nil {
-			warn("systemctl disable --now %s: %v: %s", f.unit, err, out)
+		args := []string{"disable", "--now", f.unit}
+		if f.unit == "nftables.service" {
+			// Its stop action is `nft flush ruleset`: stopping it would wipe our
+			// table. It only needs to stop starting at boot; the config it
+			// loads (/etc/nftables.conf) is ours now anyway.
+			args = []string{"disable", f.unit}
+		}
+		if out, err := sh("systemctl", args...); err != nil {
+			warn("systemctl %s: %v: %s", strings.Join(args, " "), err, out)
 		}
 	}
 	for _, t := range iptablesTools {
-		if _, err := exec.LookPath(t); err != nil {
+		if _, err := lookPath(t); err != nil {
 			continue
 		}
 		for _, ch := range []string{"INPUT", "FORWARD", "OUTPUT"} {
@@ -113,15 +143,12 @@ func DisableFirewalls(found []Finding) (warnings []string) {
 			sh(t, "-t", tb, "-X")
 		}
 	}
-	if _, err := exec.LookPath("nft"); err == nil {
-		sh("nft", "flush", "ruleset")
-	}
 	return warnings
 }
 
 // EnsureNft returns the path of the nft binary, installing the package if needed.
 func EnsureNft() (string, error) {
-	if p, err := exec.LookPath("nft"); err == nil {
+	if p, err := lookPath("nft"); err == nil {
 		return p, nil
 	}
 	type pm struct {
@@ -136,13 +163,13 @@ func EnsureNft() (string, error) {
 		{"pacman", []string{"-S", "--noconfirm", "nftables"}},
 		{"apk", []string{"add", "nftables"}},
 	} {
-		if _, err := exec.LookPath(m.bin); err != nil {
+		if _, err := lookPath(m.bin); err != nil {
 			continue
 		}
 		if out, err := sh(m.bin, m.args...); err != nil {
 			return "", fmt.Errorf("%s %s: %v\n%s", m.bin, strings.Join(m.args, " "), err, out)
 		}
-		if p, err := exec.LookPath("nft"); err == nil {
+		if p, err := lookPath("nft"); err == nil {
 			return p, nil
 		}
 	}
@@ -185,7 +212,7 @@ func InstallBinary() error {
 
 // WriteUnits installs spa-firewall.service (loads the ruleset very early at
 // boot) and spa-server.service (the daemon).
-func WriteUnits(nftBin, dir, rulesPath string) error {
+func WriteUnits(nftBin, dir, bootConf string) error {
 	fw := fmt.Sprintf(`[Unit]
 Description=SPA firewall (nftables default-deny ruleset)
 DefaultDependencies=no
@@ -201,7 +228,7 @@ ExecStart=%s -f %s
 
 [Install]
 WantedBy=sysinit.target
-`, nftBin, rulesPath)
+`, nftBin, bootConf)
 	srv := fmt.Sprintf(`[Unit]
 Description=SPA knock daemon
 After=spa-firewall.service network.target

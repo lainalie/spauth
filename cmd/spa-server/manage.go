@@ -78,6 +78,14 @@ func deleteCmd(args []string) {
 	if errors.Is(err, firewall.ErrNotFound) {
 		log.Fatalf("no allowed client matches %q (see `spa-server list`)", fs.Arg(0))
 	}
+	if errors.Is(err, firewall.ErrNotSaved) {
+		for _, e := range removed {
+			fmt.Printf("Removed #%s %s from the running firewall.\n", orDash(e.ID), e.IP)
+		}
+		log.Fatalf("WARNING: the removal is NOT saved to disk (%v).\n"+
+			"After a reboot or a crash the old snapshot may let this IP in again.\n"+
+			"Fix the cause (disk full? read-only filesystem?) and run `spa-server save`.", err)
+	}
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -118,6 +126,11 @@ func statusCmd(args []string) {
 	}
 	fmt.Printf("Knock port:       udp/%d\n", cfg.Port)
 	fmt.Printf("Retention:        %s\n", ret)
+	if cfg.Telegram {
+		fmt.Println("Telegram ranges:  allowed without a knock")
+	} else {
+		fmt.Println("Telegram ranges:  not allowed")
+	}
 	if err := nft.VerifyLocked(); err != nil {
 		fmt.Println("Firewall:         " + red("NOT LOCKED - this host is OPEN ("+err.Error()+")"))
 	} else {
